@@ -3,7 +3,8 @@ Script para Google Colab:
 1) Ler um CSV com IDs de custom fields do Jira.
 2) Consultar a API do Jira Cloud para cada campo.
 3) Adicionar uma coluna ao lado com os valores disponíveis.
-4) Quando o campo nao for de selecao/lista, registrar uma mensagem com o tipo.
+4) Adicionar outra coluna com o nome do tipo do campo.
+5) Quando o campo nao for de selecao/lista, registrar uma mensagem com o tipo.
 
 Uso rapido no Colab:
     !pip -q install pandas requests
@@ -231,30 +232,41 @@ def summarize_field_options(
     field_id: str,
     fields_map: Dict[str, Dict],
     jira: JiraClient,
-) -> str:
+) -> Tuple[str, str]:
     field = fields_map.get(field_id)
     if not field:
-        return f"Campo '{field_id}' nao encontrado no Jira."
+        return f"Campo '{field_id}' nao encontrado no Jira.", "nao_encontrado"
 
     field_name = str(field.get("name") or field_id)
     schema = field.get("schema") or {}
     custom_key = str(schema.get("custom") or "")
     generic_type = str(schema.get("type") or "desconhecido")
     field_type_label = custom_key or generic_type
+    field_type_name = (
+        custom_key.split(":")[-1].strip()
+        if ":" in custom_key
+        else (custom_key.strip() or generic_type)
+    )
+    if not field_type_name:
+        field_type_name = "desconhecido"
 
     if not is_select_like_field(custom_key):
         return (
             f"Campo '{field_name}' do tipo '{field_type_label}' "
-            "nao e lista/selecao."
+            "nao e lista/selecao.",
+            field_type_name,
         )
 
     try:
         contexts = jira.list_field_contexts(field_id)
     except RuntimeError as exc:
-        return f"Erro ao listar contextos de '{field_name}': {exc}"
+        return f"Erro ao listar contextos de '{field_name}': {exc}", field_type_name
 
     if not contexts:
-        return f"Campo '{field_name}' nao possui contextos configurados."
+        return (
+            f"Campo '{field_name}' nao possui contextos configurados.",
+            field_type_name,
+        )
 
     context_summaries: List[str] = []
     for context in contexts:
@@ -271,7 +283,7 @@ def summarize_field_options(
         else:
             context_summaries.append(f"{context_name}: sem opcoes")
 
-    return " | ".join(context_summaries)
+    return " | ".join(context_summaries), field_type_name
 
 
 def process_csv(
@@ -279,7 +291,7 @@ def process_csv(
     output_csv_path: str,
     jira: JiraClient,
     id_column: Optional[str] = None,
-) -> Tuple[str, str]:
+) -> Tuple[str, str, str]:
     df = pd.read_csv(input_csv_path)
     target_column = id_column or choose_id_column(df)
 
@@ -287,20 +299,27 @@ def process_csv(
         raise ValueError(f"Coluna '{target_column}' nao encontrada no CSV.")
 
     output_column = f"{target_column}_jira_valores"
+    output_type_column = f"{target_column}_jira_tipo_campo"
     insertion_index = df.columns.get_loc(target_column) + 1
     if output_column in df.columns:
         df[output_column] = ""
     else:
         df.insert(insertion_index, output_column, "")
+    type_column_index = df.columns.get_loc(output_column) + 1
+    if output_type_column in df.columns:
+        df[output_type_column] = ""
+    else:
+        df.insert(type_column_index, output_type_column, "")
 
     fields_map = jira.get_custom_fields_map()
-    cache: Dict[str, str] = {}
+    cache: Dict[str, Tuple[str, str]] = {}
 
     total_rows = len(df)
     for idx, raw_value in enumerate(df[target_column], start=1):
         normalized_id = normalize_field_id(raw_value)
         if not normalized_id:
             result = "ID vazio ou invalido."
+            type_result = "invalido"
         else:
             if normalized_id not in cache:
                 cache[normalized_id] = summarize_field_options(
@@ -308,15 +327,16 @@ def process_csv(
                     fields_map=fields_map,
                     jira=jira,
                 )
-            result = cache[normalized_id]
+            result, type_result = cache[normalized_id]
 
         df.at[idx - 1, output_column] = result
+        df.at[idx - 1, output_type_column] = type_result
 
         if idx == 1 or idx % 10 == 0 or idx == total_rows:
             print(f"Processando linha {idx}/{total_rows}...")
 
     df.to_csv(output_csv_path, index=False)
-    return target_column, output_column
+    return target_column, output_column, output_type_column
 
 
 def prompt_for_credentials() -> Tuple[str, str, str]:
@@ -370,7 +390,7 @@ def main() -> None:
     id_column_env = os.getenv("FIELD_ID_COLUMN", "").strip() or None
 
     jira = JiraClient(base_url=base_url, email=email, api_token=api_token)
-    used_id_column, created_column = process_csv(
+    used_id_column, created_column, created_type_column = process_csv(
         input_csv_path=input_csv_path,
         output_csv_path=output_csv_path,
         jira=jira,
@@ -379,7 +399,7 @@ def main() -> None:
 
     print(
         f"Concluido. Coluna de IDs: '{used_id_column}'. "
-        f"Coluna criada/atualizada: '{created_column}'."
+        f"Colunas criadas/atualizadas: '{created_column}' e '{created_type_column}'."
     )
     print(f"Arquivo gerado: {output_csv_path}")
 
