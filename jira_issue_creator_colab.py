@@ -56,6 +56,45 @@ def _is_description_field(jira_field_id: str) -> bool:
     return _normalize_token(jira_field_id) == "description"
 
 
+def _is_adf_document(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("type") == "doc"
+        and isinstance(value.get("content"), list)
+    )
+
+
+def _text_to_adf(text: str) -> Dict[str, Any]:
+    """Converte texto simples para ADF (Atlassian Document Format)."""
+    lines = text.splitlines()
+    paragraph_content: List[Dict[str, Any]] = []
+
+    for idx, line in enumerate(lines):
+        if idx > 0:
+            paragraph_content.append({"type": "hardBreak"})
+        if line:
+            paragraph_content.append({"type": "text", "text": line})
+
+    paragraph: Dict[str, Any] = {"type": "paragraph"}
+    if paragraph_content:
+        paragraph["content"] = paragraph_content
+
+    return {"type": "doc", "version": 1, "content": [paragraph]}
+
+
+def normalize_description_for_jira(value: Any) -> Any:
+    """Normaliza o campo description para o formato aceito pela API v3."""
+    if value is None:
+        return None
+    if _is_adf_document(value):
+        return value
+    if isinstance(value, str):
+        if _is_empty(value):
+            return None
+        return _text_to_adf(value.strip())
+    return value
+
+
 def _split_multi_value(raw_value: str) -> List[str]:
     if ";" in raw_value:
         parts = raw_value.split(";")
@@ -216,11 +255,15 @@ def build_issue_fields(
             continue
 
         parsed_value = format_jira_field_value(row[source_column], field_type)
+        if _is_description_field(jira_field_id):
+            parsed_value = normalize_description_for_jira(parsed_value)
         if parsed_value is not None:
             fields[jira_field_id] = parsed_value
 
     if compose_description_from_many and description_lines:
-        fields["description"] = "\n".join(description_lines)
+        fields["description"] = normalize_description_for_jira(
+            "\n".join(description_lines)
+        )
 
     if isinstance(fields.get("project"), str):
         fields["project"] = {"key": fields["project"]}
@@ -248,6 +291,26 @@ def create_issue_requests(config: JiraConfig, fields: Dict[str, Any]) -> Dict[st
             details = response.json()
         except ValueError:
             details = {"error": response.text}
+        if isinstance(details, dict):
+            error_messages = details.get("errorMessages") or []
+            field_errors = details.get("errors") or {}
+            parts: List[str] = []
+            if error_messages:
+                parts.append(
+                    "errorMessages: "
+                    + "; ".join(str(message) for message in error_messages)
+                )
+            if field_errors:
+                parts.append(
+                    "errors: "
+                    + "; ".join(
+                        f"{field_name} -> {field_message}"
+                        for field_name, field_message in field_errors.items()
+                    )
+                )
+            if not parts:
+                parts.append(json.dumps(details, ensure_ascii=False))
+            raise RuntimeError(f"Erro Jira {response.status_code}: {' | '.join(parts)}")
         raise RuntimeError(f"Erro Jira {response.status_code}: {details}")
 
     return response.json()
