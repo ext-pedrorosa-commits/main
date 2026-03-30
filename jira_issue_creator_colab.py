@@ -52,6 +52,10 @@ def _normalize_token(value: str) -> str:
     return normalized.strip().lower().replace("-", "_").replace(" ", "_")
 
 
+def _is_description_field(jira_field_id: str) -> bool:
+    return _normalize_token(jira_field_id) == "description"
+
+
 def _split_multi_value(raw_value: str) -> List[str]:
     if ";" in raw_value:
         parts = raw_value.split(";")
@@ -191,6 +195,11 @@ def build_issue_fields(
         "project": {"key": default_project_key},
         "issuetype": {"name": default_issue_type},
     }
+    description_lines: List[str] = []
+    description_mappings_count = int(
+        mapping_df["jira_field_id"].apply(_is_description_field).sum()
+    )
+    compose_description_from_many = description_mappings_count > 1
 
     for _, mapping in mapping_df.iterrows():
         source_column = mapping["source_column"]
@@ -200,9 +209,18 @@ def build_issue_fields(
         if source_column not in row.index:
             continue
 
+        if compose_description_from_many and _is_description_field(jira_field_id):
+            raw_value = str(row[source_column]).strip()
+            if not _is_empty(raw_value):
+                description_lines.append(f"[{source_column}]: {raw_value}")
+            continue
+
         parsed_value = format_jira_field_value(row[source_column], field_type)
         if parsed_value is not None:
             fields[jira_field_id] = parsed_value
+
+    if compose_description_from_many and description_lines:
+        fields["description"] = "\n".join(description_lines)
 
     if isinstance(fields.get("project"), str):
         fields["project"] = {"key": fields["project"]}
