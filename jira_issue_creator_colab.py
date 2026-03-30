@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List
 
 import pandas as pd
@@ -82,8 +83,22 @@ def _text_to_adf(text: str) -> Dict[str, Any]:
     return {"type": "doc", "version": 1, "content": [paragraph]}
 
 
+def _looks_like_adf_error(error_message: str) -> bool:
+    token = (error_message or "").strip().lower()
+    indicators = (
+        "atlassian document",
+        "adf",
+        "type: doc",
+        "type doc",
+        "must be an object",
+        "document format",
+        "rich text",
+    )
+    return any(indicator in token for indicator in indicators)
+
+
 def normalize_description_for_jira(value: Any) -> Any:
-    """Normaliza o campo description para o formato aceito pela API v3."""
+    """Normaliza description para o formato aceito pela API v3."""
     if value is None:
         return None
     if _is_adf_document(value):
@@ -113,17 +128,50 @@ def _try_parse_json(raw_value: str) -> Any:
         return raw_value
 
 
+def _to_jira_date(raw_value: str) -> str:
+    """Converte datas comuns para formato Jira datepicker: yyyy-mm-dd."""
+    value = raw_value.strip()
+    if _is_empty(value):
+        return value
+
+    # Formato ja esperado pelo Jira.
+    for date_fmt in ("%Y-%m-%d",):
+        try:
+            return datetime.strptime(value, date_fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # Formatos de entrada comuns em CSV.
+    for date_fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(value, date_fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    raise ValueError(
+        f"Data invalida '{raw_value}'. Use formatos como dd/mm/yyyy ou yyyy-mm-dd."
+    )
+
+
 def resolve_field_type(field_type: str) -> str:
     token = _normalize_token(field_type)
     aliases = {
         "text": {"texto", "text", "string", "plain_text"},
+        "richtext": {
+            "richtext",
+            "rich_text",
+            "textarea",
+            "texto_rico",
+            "descricao_rica",
+            "adf",
+        },
         "number": {"numero", "number", "int", "integer", "float", "double"},
         "user": {"usuario", "user", "accountid"},
         "user_list": {"usuarios", "multiuser", "user_list", "lista_usuarios"},
         "select": {"select", "single_select", "lista_selecao", "option"},
         "multiselect": {"multiselect", "multi_select", "lista", "checkbox"},
         "labels": {"labels", "rotulos", "tags"},
-        "date": {"date", "data"},
+        "date": {"date", "data", "datepicker"},
         "datetime": {"datetime", "datahora", "date_time"},
         "project": {"project", "projeto"},
         "issuetype": {"issuetype", "tipo_issue", "tipo_da_issue"},
@@ -150,13 +198,18 @@ def format_jira_field_value(raw_value: Any, field_type: str) -> Any:
     if canonical_type == "text":
         return raw_as_text
 
+    if canonical_type == "richtext":
+        if _is_adf_document(parsed_json):
+            return parsed_json
+        return _text_to_adf(raw_as_text)
+
     if canonical_type == "number":
         if "." in raw_as_text:
             return float(raw_as_text)
         return int(raw_as_text)
 
     if canonical_type == "date":
-        return raw_as_text
+        return _to_jira_date(raw_as_text)
 
     if canonical_type == "datetime":
         return raw_as_text
@@ -276,9 +329,9 @@ def build_issue_fields(
     return fields
 
 
-def create_issue_requests(config: JiraConfig, fields: Dict[str, Any]) -> Dict[str, Any]:
+def _post_issue_request(config: JiraConfig, fields: Dict[str, Any]) -> requests.Response:
     endpoint = f"{config.jira_url.rstrip('/')}/rest/api/3/issue"
-    response = requests.post(
+    return requests.post(
         endpoint,
         auth=(config.jira_email, config.jira_api_token),
         headers={"Accept": "application/json", "Content-Type": "application/json"},
@@ -286,11 +339,55 @@ def create_issue_requests(config: JiraConfig, fields: Dict[str, Any]) -> Dict[st
         timeout=30,
     )
 
+
+def _parse_error_details(response: requests.Response) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        return {"error": response.text}
+
+
+def _apply_adf_retry_if_needed(
+    fields: Dict[str, Any], details: Any
+) -> tuple[Dict[str, Any], List[str]]:
+    if not isinstance(details, dict):
+        return fields, []
+
+    field_errors = details.get("errors") or {}
+    if not isinstance(field_errors, dict):
+        return fields, []
+
+    updated_fields = dict(fields)
+    converted_fields: List[str] = []
+
+    for field_name, field_message in field_errors.items():
+        if field_name == "summary" or field_name not in updated_fields:
+            continue
+        current_value = updated_fields[field_name]
+        if not isinstance(current_value, str) or _is_empty(current_value):
+            continue
+        if not _looks_like_adf_error(str(field_message)):
+            continue
+        updated_fields[field_name] = _text_to_adf(current_value.strip())
+        converted_fields.append(field_name)
+
+    return updated_fields, converted_fields
+
+
+def create_issue_requests(config: JiraConfig, fields: Dict[str, Any]) -> Dict[str, Any]:
+    response = _post_issue_request(config, fields)
+    retried_fields: List[str] = []
+
     if response.status_code >= 400:
-        try:
-            details = response.json()
-        except ValueError:
-            details = {"error": response.text}
+        details = _parse_error_details(response)
+
+        retry_fields, retried_fields = _apply_adf_retry_if_needed(fields, details)
+        if retried_fields:
+            response = _post_issue_request(config, retry_fields)
+            if response.status_code < 400:
+                return response.json()
+            details = _parse_error_details(response)
+
         if isinstance(details, dict):
             error_messages = details.get("errorMessages") or []
             field_errors = details.get("errors") or {}
@@ -307,6 +404,10 @@ def create_issue_requests(config: JiraConfig, fields: Dict[str, Any]) -> Dict[st
                         f"{field_name} -> {field_message}"
                         for field_name, field_message in field_errors.items()
                     )
+                )
+            if retried_fields:
+                parts.append(
+                    "ADF retry attempted for: " + ", ".join(sorted(retried_fields))
                 )
             if not parts:
                 parts.append(json.dumps(details, ensure_ascii=False))
@@ -342,6 +443,11 @@ def load_config_from_colab(
         default_issue_type=default_issue_type,
         dry_run=dry_run,
     )
+
+
+def _apply_pandas_display_defaults() -> None:
+    pd.set_option("display.max_colwidth", None)
+    pd.set_option("display.width", None)
 
 
 def create_issues_from_csv(
@@ -424,4 +530,5 @@ if __name__ == "__main__":
         config=jira_config,
     )
 
+    _apply_pandas_display_defaults()
     print(result_df)
